@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"context"
 	"crypto/ecdsa"
+	_ "embed"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"math/big"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -17,13 +20,38 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Halimao/Chaos/Chain/ERC20TokenRescue/erc20"
+	"github.com/Halimao/Chaos/Chain/ERC20TokenRescue/input"
+	"github.com/bytedance/sonic"
+	"github.com/common-nighthawk/go-figure"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/lfz941/ERC20TokenRescue/erc20"
-	"github.com/lfz941/ERC20TokenRescue/input"
 )
+
+var (
+	evmChainID2ChainMetadata   = make(map[int64]EVMChainMetadata)
+	evmChainName2ChainMetadata = make(map[string]EVMChainMetadata)
+
+	//go:embed evm_chain_metadata.json
+	evmChainMetadataConf string
+)
+
+type EVMChainMetadata struct {
+	Name           string `json:"name"`
+	ChainID        int64  `json:"chainId"`
+	ShortName      string `json:"shortName"`
+	NetworkID      int64  `json:"networkId"`
+	NativeCurrency struct {
+		Name     string `json:"name"`
+		Symbol   string `json:"symbol"`
+		Decimals int    `json:"decimals"`
+	} `json:"nativeCurrency"`
+	RPC     []string `json:"rpc"`
+	Faucets []string `json:"faucets"`
+	InfoURL string   `json:"infoURL"`
+}
 
 type RPCCli struct {
 	RPC string
@@ -34,12 +62,12 @@ var defaultRPCEndpoints = []string{
 	"https://rpc.ankr.com/eth",
 	"https://ethereum.rpc.subquery.network/public",
 	"https://ethereum-rpc.publicnode.com",
-	"https://cloudflare-eth.com/",
 	"https://1rpc.io/eth",
 	"https://eth-mainnet.public.blastapi.io",
 	"https://eth.drpc.org",
 	"https://gateway.tenderly.co/public/mainnet",
 	"https://eth-mainnet-public.unifra.io",
+	"https://ethereum.blockpi.network/v1/rpc/public",
 }
 
 var (
@@ -49,17 +77,27 @@ var (
 var (
 	rpcEndpoints  = flag.String("nodes", "", "multiple nodes can be splited with comma. there are default eth rpc endpoints if nodes is empty")
 	token         = flag.String("token", "0xec53bf9167f50cdeb3ae105f56099aaab9061f83", "erc20 token addr")
-	privateKeyHex = flag.String("priv", "", "priv key") // TODO change to interactive input
+	privateKeyHex = flag.String("priv", "", "priv key")
 	targetAddrHex = flag.String("to", "", "the target address that erc20 token should transfer to")
 	startAt       = flag.Int64("begin", 0, "schedule the begin timestamp, unit(s)")
+	gasLimit      = flag.Uint64("gasLimit", 80000, "gas limit")
+	gasMultiplier = flag.Int64("gasMultiplier", 3, "gas multiplier of suggest price")
 )
 
 func main() {
-	flag.Parse()
+	figure.NewFigure("ERC20TokenRescue", "standard", true).Print()
+	fmt.Println()
 
+	flag.Parse()
+	initEVMChainMetadata(true)
 	// check flag value
 	if *privateKeyHex == "" {
-		panic("the priv key shouldn't be empty")
+		buf := bufio.NewReader(os.Stdin)
+		priv, err := input.GetSecretString("please input your private key here\n", buf)
+		if err != nil {
+			panic(err)
+		}
+		*privateKeyHex = priv
 	}
 	if *targetAddrHex == "" {
 		panic("the target address shouldn't be empty")
@@ -127,8 +165,13 @@ func main() {
 		panic(err)
 	}
 	balStr, _ := formatTokenAmtToHumanReadable(bal, int(tokenDecimal), 2)
-	slog.With("b", balStr+tokenSymbol).Info("bal info")
-	yes, err := input.GetConfirmation(fmt.Sprintf("Please confirm the rescue info: \n chainID: %d \n user: %s \n erc20 token: %s(%s) \n bal: %s \n", chainID.Int64(), accAddr.Hex(), tokenSymbol, tokenAddr.Hex(), balStr), bufio.NewReader(os.Stderr), os.Stderr)
+	startAtHuman := ""
+	if *startAt == 0 {
+		startAtHuman = "Right Now. Let's Go!!!"
+	} else {
+		startAtHuman = time.Unix(*startAt, 0).UTC().Format(time.RFC3339)
+	}
+	yes, err := input.GetConfirmation(fmt.Sprintf("Please confirm the rescue info: \n chainID: %d \n network: %s \n from: %s \n to: %s \n erc20 token: %s(%s) \n bal: %s \n startAt: %s \n", chainID.Int64(), evmChainID2ChainMetadata[chainID.Int64()].Name, accAddr.Hex(), targetAddr.Hex(), tokenSymbol, tokenAddr.Hex(), balStr, startAtHuman), bufio.NewReader(os.Stderr), os.Stderr)
 	if err != nil {
 		panic(err)
 	}
@@ -138,11 +181,11 @@ func main() {
 
 	now := time.Now().Unix()
 	if *startAt > now {
-		waitDur := time.Duration(now-*startAt) * time.Second
+		waitDur := time.Duration(*startAt-now) * time.Second
 		fmt.Printf("rescue job was scheduled starting after %v\n", waitDur)
 		<-time.After(waitDur)
 	}
-	fmt.Println("start rescue job now")
+	fmt.Println("Start rescue job now. Let's Go!!!")
 	for {
 		select {
 		case <-ctx.Done():
@@ -158,6 +201,13 @@ func main() {
 				wg     sync.WaitGroup
 				txHash string
 			)
+			gas, err := masterRpcCli.SuggestGasPrice(context.Background())
+			if err != nil {
+				slog.With("err", err).Error("SuggestGasPrice error")
+				continue
+			}
+			transactOpts.GasPrice = new(big.Int).Mul(gas, big.NewInt(*gasMultiplier))
+			transactOpts.GasLimit = *gasLimit
 			wg.Add(len(rpcClients))
 			for i := range rpcClients {
 				go func(i int) {
@@ -199,4 +249,50 @@ func initEthCli(idx int, rpc string) *ethclient.Client {
 		return nil
 	}
 	return ethCli
+}
+
+func initEVMChainMetadata(loadFromLocal bool) error {
+	var (
+		body []byte
+		err  error
+	)
+	if loadFromLocal {
+		body = []byte(evmChainMetadataConf)
+	} else {
+		url := "https://chainid.network/chains_mini.json"
+		method := "GET"
+
+		client := &http.Client{}
+		req, err := http.NewRequest(method, url, nil)
+
+		if err != nil {
+			return err
+		}
+		res, err := client.Do(req)
+
+		if err != nil {
+			slog.Error("initEVMChainMetadata error, changed to use local file evm_chain_metadata.json", "err", err)
+			body = []byte(evmChainMetadataConf)
+		} else {
+			defer res.Body.Close()
+			body, err = io.ReadAll(res.Body)
+		}
+
+		if err != nil {
+			return err
+		}
+	}
+
+	var chains []EVMChainMetadata
+	err = sonic.Unmarshal(body, &chains)
+	if err != nil {
+		return err
+	}
+
+	for i, chain := range chains {
+		evmChainID2ChainMetadata[chain.ChainID] = chains[i]
+		evmChainName2ChainMetadata[chain.Name] = chains[i]
+		evmChainName2ChainMetadata[chain.ShortName] = chains[i]
+	}
+	return nil
 }
