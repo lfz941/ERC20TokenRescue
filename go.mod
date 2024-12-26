@@ -6,6 +6,7 @@ toolchain go1.22.7
 
 require (
 	github.com/bgentry/speakeasy v0.2.0
+        github.com/common-nighthawk/go-figure v0.0.0-20210622060536-734e95fb86be
 	github.com/ethereum/go-ethereum v1.14.9
 	github.com/mattn/go-isatty v0.0.20
 )
